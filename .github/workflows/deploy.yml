@@ -7,8 +7,17 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write   # Obrigatório para a autenticação OIDC (Passwordless)
-  contents: read    # Permitir leitura do código do repositório
+  id-token: write   # Obrigatório para autenticação OIDC (Passwordless)
+  contents: read    # Leitura do código-fonte
+
+env:
+  RESOURCE_GROUP: "rg-imersao-arquitetoazure"
+  AKS_CLUSTER: "aks-imersao-elfarias"
+  ACR_NAME: "acrimersaoelfarias"
+  ACR_REGISTRY: "acrimersaoelfarias.azurecr.io"
+  IMAGE_NAME: "azure-shop"
+  K8S_NAMESPACE: "azure-shop"
+  K8S_DEPLOYMENT: "azure-shop"
 
 jobs:
   build-and-deploy:
@@ -25,12 +34,38 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: Validar Conexão com o Azure
+      - name: Login no Azure Container Registry (ACR)
         run: |
-          echo "Autenticado com sucesso no Azure sem utilizar senhas estáticas!"
-          az group show --name rg-imersao-arquitetoazure --output table
+          az acr login --name ${{ env.ACR_NAME }}
 
-      - name: Conectar ao AKS e Verificar Pods
+      - name: Build e Push da Imagem Docker
         run: |
-          az aks get-credentials --resource-group rg-imersao-arquitetoazure --name aks-imersao-elfarias --overwrite-existing
-          kubectl get pods -n azure-shop
+          # Gerar tags: uma imutável com o SHA do commit e a tag 'latest'
+          IMAGE_TAG=${{ github.sha }}
+          FULL_IMAGE_NAME=${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          
+          echo "Construindo imagem: ${FULL_IMAGE_NAME}:${IMAGE_TAG}"
+          docker build -t ${FULL_IMAGE_NAME}:${IMAGE_TAG} -t ${FULL_IMAGE_NAME}:latest .
+          
+          echo "Enviando imagens para o ACR..."
+          docker push ${FULL_IMAGE_NAME}:${IMAGE_TAG}
+          docker push ${FULL_IMAGE_NAME}:latest
+
+      - name: Conectar ao AKS
+        run: |
+          az aks get-credentials --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.AKS_CLUSTER }} --overwrite-existing
+
+      - name: Atualizar a Imagem no AKS (Rolling Update)
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          FULL_IMAGE_NAME=${{ env.ACR_REGISTRY }}/${{ env.IMAGE_NAME }}
+          
+          echo "Atualizando a imagem do Deployment no Kubernetes..."
+          kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} ${{ env.IMAGE_NAME }}=${FULL_IMAGE_NAME}:${IMAGE_TAG} -n ${{ env.K8S_NAMESPACE }}
+          
+          echo "Aguardando conclusão do Rollout..."
+          kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }} -n ${{ env.K8S_NAMESPACE }} --timeout=120s
+
+      - name: Verificar Pods Ativos
+        run: |
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }} -o wide
